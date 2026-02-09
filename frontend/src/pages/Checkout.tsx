@@ -3,7 +3,7 @@ import { motion } from "framer-motion";
 import { useCartStore } from "../store/cartStore";
 import { useToastStore } from "../store/toastStore";
 import { useUiStore } from "../store/uiStore";
-import { submitOrder } from "../utils/api";
+import { submitOrder, OrderPayload } from "../utils/api";
 import { useI18n } from "../utils/useI18n";
 
 type Status = "idle" | "sent" | "queued" | "failed";
@@ -38,43 +38,32 @@ export default function Checkout() {
       return;
     }
 
-    // Backend expects: items[].selectedSize as INTEGER (because DB uses PositiveIntegerField)
-    // Make sure every item has valid integer size.
+    // ВАЖНО: этот фронт сейчас поддерживает только integer selectedSize
+    // (потому что ваш текущий backend/model был под int)
+    // Если хотите 19.5 — это правится на backend (DecimalField) + сериалайзер.
     for (const item of items) {
-      const sizeNumber = Number(String(item.selectedSize).replace(",", "."));
-      if (!Number.isFinite(sizeNumber)) {
+      const sizeNum = Number(item.selectedSize);
+      if (!Number.isFinite(sizeNum)) {
         toast.push(`Ошибка в товаре ${item.title}: некорректный размер`, "error");
         return;
       }
-      const sizeInt = Math.round(sizeNumber);
-      if (!Number.isFinite(sizeInt) || sizeInt <= 0) {
-        toast.push(`Ошибка в товаре ${item.title}: некорректный размер`, "error");
-        return;
-      }
+      // оставляем как есть, но приводим к числу
     }
 
-    const payload = {
-      customer: {
-        name: form.name,
-        phone: form.phone,
-        address: form.address,
-        comment: form.comment,
-        telegram_username: form.telegramUsername, // IMPORTANT: underscore like backend
-      },
-      items: items.map((item) => {
-        const sizeNumber = Number(String(item.selectedSize).replace(",", "."));
-        const sizeInt = Math.round(sizeNumber);
-
-        return {
-          productSlug: item.productSlug, // IMPORTANT: camelCase like backend serializer
-          qty: Number(item.qty),
-          selectedSize: sizeInt,
-        };
-      }),
+    // ✅ Делаем OrderPayload (старый формат), который ожидает submitOrder()
+    const payload: OrderPayload = {
+      customer_name: form.name,
+      phone: form.phone,
+      address: form.address,
+      comment: form.comment,
+      telegram_username: form.telegramUsername,
+      items: items.map((item) => ({
+        product_slug: item.productSlug,
+        size: Number(item.selectedSize),
+        qty: Number(item.qty),
+      })),
       meta: { locale, theme },
     };
-
-    console.log("PAYLOAD_JSON", JSON.stringify(payload, null, 2));
 
     try {
       const result = await submitOrder(payload);
@@ -91,7 +80,6 @@ export default function Checkout() {
         return;
       }
 
-      console.error("Order submission failed:", result);
       setStatus("failed");
       toast.push(result.errorMessage || t.toast.orderError, "error");
     } catch (err) {
@@ -192,7 +180,7 @@ export default function Checkout() {
                   {item.title}
                 </p>
                 <p className="text-xs text-slate-500">
-                  {item.selectedSize} • {item.qty}x
+                  {item.selectedSize} {"•"} {item.qty}x
                 </p>
               </div>
               <p className="text-sm font-semibold text-brand-600">
