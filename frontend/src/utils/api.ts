@@ -11,16 +11,15 @@ const BACKEND_5XX_COOLDOWN_KEY = "orders_backend_5xx_cooldown_v1";
 const BACKEND_5XX_COOLDOWN_MS = 5 * 60 * 1000;
 
 export interface Product {
-  id: number;
+  id: string; // UUID from Django
   slug: string;
   title: string;
   description: string;
   price_uzs: number;
+  currency?: string;
+  sizes: Array<number | string>;
+  in_stock: boolean;
   image_urls: string[];
-  category?: string;
-  available_sizes?: number[];
-  sizes?: number[];
-  is_new?: boolean;
   created_at: string;
 }
 
@@ -32,7 +31,7 @@ export interface OrderPayload {
   telegram_username?: string;
   items: Array<{
     product_slug: string;
-    size: number;
+    size: number; // IMPORTANT: number (can be 15.5 etc)
     qty: number;
   }>;
   meta?: {
@@ -112,7 +111,9 @@ function saveCache(data: Product[]): void {
   try {
     localStorage.setItem(CACHE_KEY, JSON.stringify(data));
     localStorage.setItem(CACHE_TS_KEY, String(Date.now()));
-  } catch { }
+  } catch {
+    // ignore
+  }
 }
 
 function generateOrderId(): string {
@@ -134,24 +135,39 @@ async function postOrder(order: OrderPayload): Promise<PostOrderResult> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(toBackendFormat(order)),
   });
+
   if (res.status === 409) {
     return { ok: true, data: { status: "already_exists" } };
   }
+
   if (res.status >= 500) {
     try {
       localStorage.setItem(BACKEND_5XX_COOLDOWN_KEY, String(Date.now()));
-    } catch { }
+    } catch {
+      // ignore
+    }
     return { ok: false, status: res.status };
   }
+
   if (!res.ok) {
     let errorMessage = "";
     try {
       const body = await res.json();
-      if (body?.items) errorMessage = typeof body.items === "string" ? body.items : body.items[0];
-      else if (body?.detail) errorMessage = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
-    } catch { }
+      if (body?.items) {
+        errorMessage =
+          typeof body.items === "string" ? body.items : body.items[0];
+      } else if (body?.detail) {
+        errorMessage =
+          typeof body.detail === "string"
+            ? body.detail
+            : JSON.stringify(body.detail);
+      }
+    } catch {
+      // ignore
+    }
     return { ok: false, status: res.status, errorMessage };
   }
+
   return { ok: true, data: await res.json() };
 }
 
@@ -159,9 +175,15 @@ export async function submitOrder(
   order: OrderPayload
 ): Promise<{ ok: boolean; queued: boolean; errorMessage?: string }> {
   const result = await postOrder(order);
+
   if (result.ok) return { ok: true, queued: false };
+
   if (result.status >= 500) return { ok: false, queued: false };
-  if (result.status >= 400) return { ok: false, queued: false, errorMessage: result.errorMessage };
+
+  if (result.status >= 400)
+    return { ok: false, queued: false, errorMessage: result.errorMessage };
+
+  // На практике сюда почти не попадёте, но оставим:
   const queue = loadQueue();
   const orderId = generateOrderId();
   queue.push({ orderId, order, createdAt: Date.now() });
@@ -173,24 +195,32 @@ let flushInProgress = false;
 
 export async function flushOrderQueue(): Promise<void> {
   if (flushInProgress) return;
+
   const cooldown = localStorage.getItem(BACKEND_5XX_COOLDOWN_KEY);
   if (cooldown) {
     const elapsed = Date.now() - parseInt(cooldown, 10);
     if (elapsed < BACKEND_5XX_COOLDOWN_MS) return;
     try {
       localStorage.removeItem(BACKEND_5XX_COOLDOWN_KEY);
-    } catch { }
+    } catch {
+      // ignore
+    }
   }
+
   flushInProgress = true;
   try {
     let queue = loadQueue();
     if (!queue.length) return;
 
     for (const item of queue) {
+      // пробуем отправить по очереди
       const rest = queue.filter((q) => q.orderId !== item.orderId);
       saveQueue(rest);
       queue = rest;
+
       const result = await postOrder(item.order);
+
+      // если 4xx — значит данные плохие, вернём обратно в очередь
       if (!result.ok && result.status < 500) {
         queue = [...queue, item];
         saveQueue(queue);
@@ -214,12 +244,13 @@ export async function fetchProductsWithRetry(): Promise<{
   error: string | null;
 }> {
   const cached = loadCache();
+
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const data = await getProducts();
       saveCache(data);
       return { data, error: null };
-    } catch (e) {
+    } catch {
       if (attempt < 3) {
         await new Promise((r) => setTimeout(r, 800 * attempt));
       } else {
@@ -233,23 +264,15 @@ export async function fetchProductsWithRetry(): Promise<{
       }
     }
   }
+
   return { data: loadCache(), error: "Не удалось загрузить товары." };
 }
 
 export async function fetchProduct(slug: string): Promise<Product> {
   const url = `${API.replace(/\/$/, "")}/api/products/${slug}/`;
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`Failed to fetch product: ${response.statusText}`);
-  return response.json();
-}
-
-export async function fetchProductWithCache(slug: string): Promise<{
-  product: Product | null;
-  fromCache: boolean;
-}> export async function fetchProduct(slug: string): Promise<Product> {
-  const url = `${API.replace(/\/$/, "")}/api/products/${slug}/`;
   const response = await fetch(url, { cache: "no-store" });
-  if (!response.ok) throw new Error(`Failed to fetch product: ${response.statusText}`);
+  if (!response.ok)
+    throw new Error(`Failed to fetch product: ${response.statusText}`);
   return response.json();
 }
 
@@ -270,7 +293,8 @@ export async function fetchProductWithCache(slug: string): Promise<{
 export async function fetchProducts(): Promise<Product[]> {
   const url = `${API.replace(/\/$/, "")}/api/products/`;
   const response = await fetch(url, { cache: "no-store" });
-  if (!response.ok) throw new Error(`Failed to fetch products: ${response.statusText}`);
+  if (!response.ok)
+    throw new Error(`Failed to fetch products: ${response.statusText}`);
   const data = await response.json();
   return Array.isArray(data) ? data : [];
 }
