@@ -31,7 +31,7 @@ export interface OrderPayload {
   telegram_username?: string;
   items: Array<{
     product_slug: string;
-    size: number; // IMPORTANT: number (can be 15.5 etc)
+    size: number; // can be 15.5 etc
     qty: number;
   }>;
   meta?: {
@@ -46,7 +46,16 @@ interface QueuedOrder {
   createdAt: number;
 }
 
-/** Преобразует наш payload в формат бэкенда (customer, productSlug, selectedSize) */
+export type SubmitOrderResult = { ok: boolean; queued: boolean; errorMessage?: string };
+
+export type PostOrderResult =
+  | { ok: true; data: unknown }
+  | { ok: false; status: number; errorMessage?: string };
+
+export type FetchProductsWithRetryResult = { data: Product[]; error: string | null };
+export type FetchProductWithCacheResult = { product: Product | null; fromCache: boolean };
+
+/** Convert frontend order payload to backend format: {customer, items[], meta} */
 function toBackendFormat(p: OrderPayload): Record<string, unknown> {
   return {
     customer: {
@@ -68,12 +77,16 @@ function toBackendFormat(p: OrderPayload): Record<string, unknown> {
   };
 }
 
-function loadQueue(): QueuedOrder[] {
+function safeJsonParse<T>(raw: string | null, fallback: T): T {
   try {
-    return JSON.parse(localStorage.getItem(QUEUE_KEY) || "[]");
+    return raw ? (JSON.parse(raw) as T) : fallback;
   } catch {
-    return [];
+    return fallback;
   }
+}
+
+function loadQueue(): QueuedOrder[] {
+  return safeJsonParse<QueuedOrder[]>(localStorage.getItem(QUEUE_KEY), []);
 }
 
 function saveQueue(queue: QueuedOrder[]): void {
@@ -88,14 +101,8 @@ export function getQueueLength(): number {
 }
 
 export function loadCache(): Product[] {
-  try {
-    const raw = localStorage.getItem(CACHE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
+  const parsed = safeJsonParse<unknown>(localStorage.getItem(CACHE_KEY), []);
+  return Array.isArray(parsed) ? (parsed as Product[]) : [];
 }
 
 export function getCacheTimestamp(): number | null {
@@ -124,10 +131,6 @@ function generateOrderId(): string {
   });
 }
 
-type PostOrderResult =
-  | { ok: true; data: unknown }
-  | { ok: false; status: number; errorMessage?: string };
-
 async function postOrder(order: OrderPayload): Promise<PostOrderResult> {
   const url = `${API.replace(/\/$/, "")}/api/orders/`;
   const res = await fetch(url, {
@@ -154,13 +157,12 @@ async function postOrder(order: OrderPayload): Promise<PostOrderResult> {
     try {
       const body = await res.json();
       if (body?.items) {
-        errorMessage =
-          typeof body.items === "string" ? body.items : body.items[0];
+        errorMessage = typeof body.items === "string" ? body.items : body.items[0];
       } else if (body?.detail) {
         errorMessage =
-          typeof body.detail === "string"
-            ? body.detail
-            : JSON.stringify(body.detail);
+          typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+      } else {
+        errorMessage = JSON.stringify(body);
       }
     } catch {
       // ignore
@@ -171,19 +173,21 @@ async function postOrder(order: OrderPayload): Promise<PostOrderResult> {
   return { ok: true, data: await res.json() };
 }
 
-export async function submitOrder(
-  order: OrderPayload
-): Promise<{ ok: boolean; queued: boolean; errorMessage?: string }> {
+export async function submitOrder(order: OrderPayload): Promise<SubmitOrderResult> {
   const result = await postOrder(order);
 
   if (result.ok) return { ok: true, queued: false };
 
-  if (result.status >= 500) return { ok: false, queued: false };
+  if (result.status >= 500) {
+    // 5xx: don't enqueue, just fail (you can change policy if you want)
+    return { ok: false, queued: false };
+  }
 
-  if (result.status >= 400)
+  if (result.status >= 400) {
     return { ok: false, queued: false, errorMessage: result.errorMessage };
+  }
 
-  // На практике сюда почти не попадёте, но оставим:
+  // fallback: enqueue
   const queue = loadQueue();
   const orderId = generateOrderId();
   queue.push({ orderId, order, createdAt: Date.now() });
@@ -213,14 +217,14 @@ export async function flushOrderQueue(): Promise<void> {
     if (!queue.length) return;
 
     for (const item of queue) {
-      // пробуем отправить по очереди
+      // remove item before attempt
       const rest = queue.filter((q) => q.orderId !== item.orderId);
       saveQueue(rest);
       queue = rest;
 
       const result = await postOrder(item.order);
 
-      // если 4xx — значит данные плохие, вернём обратно в очередь
+      // If 4xx: data invalid -> return to queue (or drop; your choice)
       if (!result.ok && result.status < 500) {
         queue = [...queue, item];
         saveQueue(queue);
@@ -231,18 +235,24 @@ export async function flushOrderQueue(): Promise<void> {
   }
 }
 
+function normalizeProductsResponse(data: any): Product[] {
+  // supports:
+  // 1) [ ... ]
+  // 2) { results: [ ... ] } (DRF pagination)
+  if (Array.isArray(data)) return data as Product[];
+  if (data && Array.isArray(data.results)) return data.results as Product[];
+  return [];
+}
+
 async function getProducts(): Promise<Product[]> {
   const url = `${API.replace(/\/$/, "")}/api/products/`;
   const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
-  return Array.isArray(data) ? data : [];
+  return normalizeProductsResponse(data);
 }
 
-export async function fetchProductsWithRetry(): Promise<{
-  data: Product[];
-  error: string | null;
-}> {
+export async function fetchProductsWithRetry(): Promise<FetchProductsWithRetryResult> {
   const cached = loadCache();
 
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -271,15 +281,11 @@ export async function fetchProductsWithRetry(): Promise<{
 export async function fetchProduct(slug: string): Promise<Product> {
   const url = `${API.replace(/\/$/, "")}/api/products/${slug}/`;
   const response = await fetch(url, { cache: "no-store" });
-  if (!response.ok)
-    throw new Error(`Failed to fetch product: ${response.statusText}`);
+  if (!response.ok) throw new Error(`Failed to fetch product: ${response.statusText}`);
   return response.json();
 }
 
-export async function fetchProductWithCache(slug: string): Promise<{
-  product: Product | null;
-  fromCache: boolean;
-}> {
+export async function fetchProductWithCache(slug: string): Promise<FetchProductWithCacheResult> {
   try {
     const product = await fetchProduct(slug);
     return { product, fromCache: false };
@@ -293,10 +299,9 @@ export async function fetchProductWithCache(slug: string): Promise<{
 export async function fetchProducts(): Promise<Product[]> {
   const url = `${API.replace(/\/$/, "")}/api/products/`;
   const response = await fetch(url, { cache: "no-store" });
-  if (!response.ok)
-    throw new Error(`Failed to fetch products: ${response.statusText}`);
+  if (!response.ok) throw new Error(`Failed to fetch products: ${response.statusText}`);
   const data = await response.json();
-  return Array.isArray(data) ? data : [];
+  return normalizeProductsResponse(data);
 }
 
 export function getApiBase(): string {
